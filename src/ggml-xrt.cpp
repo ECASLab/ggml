@@ -122,12 +122,15 @@ GGML_CALL static void ggml_xrt_set_device(const int main_device) {
     fprintf(stderr, "Using device %d as main device\n", g_main_device);
 }
 
-int number_elements_padding(int n) {
-    if (n < 64) {
-        return 64;
+// Function to find the next power of two greater than or equal to n
+int next_power_of_two(int n) {
+    if (n <= 64) {
+    	return 64;
+    } else {
+    	return pow(2, ceil(log2(n)));
     }
-    return n;
 }
+
 
 void ggml_xrt_dup(
         const struct ggml_compute_params * params,
@@ -141,10 +144,11 @@ void ggml_xrt_dup(
 extern "C" void ggml_xrt_add(const struct ggml_compute_params * params,
               struct ggml_tensor * dst);
 
-static void ggml_xrt_add_f32(struct ggml_tensor * src0, struct ggml_tensor * src1,
+static void ggml_xrt_add_f32(const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
 
     if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
         return;
@@ -152,96 +156,75 @@ static void ggml_xrt_add_f32(struct ggml_tensor * src0, struct ggml_tensor * src
 
     const int ith = params->ith;
     const int nth = params->nth;
-    const int64_t nr = ggml_nrows(src0);
+
+    const int nr = ggml_nrows(src0);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(nb00 == sizeof(float));
     GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
 
-    // Determine padded sizes
-    int padded_ne00 = number_elements_padding((int)ne00);
-    int padded_ne01 = number_elements_padding((int)ne01);
-    int padded_ne10 = number_elements_padding((int)ne10);
+    // Rows per thread
+    const int dr = (nr + nth - 1) / nth;
 
-    // Allocate buffers
-    auto bo_a = xrt::bo(myDevice, padded_ne00 * sizeof(float), elementwise.group_id(0));
-    auto bo_b = xrt::bo(myDevice, padded_ne00 * sizeof(float), elementwise.group_id(1));
-    auto bo_c = xrt::bo(myDevice, padded_ne00 * sizeof(float), elementwise.group_id(2));
-    GGML_ASSERT(bo_a != NULL && bo_b != NULL && bo_c != NULL);
+    // Row range for this thread
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    // Determine next power of two sizes
+    int padded_ne00 = next_power_of_two(ne00);
+    int padded_ne01 = next_power_of_two(ne01);
+    int padded_ne10 = next_power_of_two(ne10);
+    int padded_ne11 = ne11;
+
+    int src0_size = ne00 * ne01;
+    int src1_size = ne10 * ne11;
+    int dst_size = ne00 * ne01;
+
+    int padded_size0 = padded_ne00 * padded_ne01;
+    int padded_size1 = padded_ne10 * padded_ne11;
+    int padded_dst_size = padded_ne00 * padded_ne01;
+
+    // Allocate XRT buffers
+    auto bo_a = xrt::bo(myDevice, padded_size0 * sizeof(float), elementwise.group_id(0));
+    auto bo_b = xrt::bo(myDevice, padded_size1 * sizeof(float), elementwise.group_id(1));
+    auto bo_c = xrt::bo(myDevice, padded_dst_size * sizeof(float), elementwise.group_id(2));
+
+    // Map buffers to host memory
     auto bo_a_map = bo_a.map<float*>();
     auto bo_b_map = bo_b.map<float*>();
     auto bo_c_map = bo_c.map<float*>();
 
-    // Temporary buffer for non-contiguous src1 data
-    float* temp_src1 = NULL;
+    // Fill the buffers with zeroes
+    std::fill(bo_a_map, bo_a_map + padded_size0, 0.0f);
+    std::fill(bo_b_map, bo_b_map + padded_size1, 0.0f);
+    std::fill(bo_c_map, bo_c_map + padded_dst_size, 0.0f);
 
-    if (nb10 != sizeof(float)) {
-        temp_src1 = (float*)malloc(ne10 * sizeof(float));
-        GGML_ASSERT(temp_src1 != NULL);
+    // Copy tensor data to buffers with broadcasting
+    for (int i = 0; i < src0_size; ++i) {
+        bo_a_map[i] = ((float*)src0->data)[i];
     }
 
-    // rows per thread
-    const int dr = (nr + nth - 1) / nth;
-
-    // row range for this thread
-    const int ir0 = dr * ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    if (nb10 == sizeof(float)) {
-        for (int ir = ir0; ir < ir1; ++ir) {
-            const int64_t i03 = ir / (ne02 * ne01);
-            const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
-            const int64_t i01 = (ir - i03 * ne02 * ne01 - i02 * ne01);
-
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = i01 % ne11;
-            const int64_t nr0 = padded_ne00 / padded_ne10;
-
-            float * dst_ptr = (float *)((char *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1);
-            float * src0_ptr = (float *)((char *)src0->data + i03 * nb03 + i02 * nb02 + i01 * nb01);
-            float * src1_ptr = (float *)((char *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11);
-
-            for (int64_t r = 0; r < nr0; ++r) {
-                bo_a_map = src0_ptr + r * padded_ne10;
-                bo_b_map = src1_ptr;
-                std::fill(bo_c_map, bo_c_map + padded_ne10, 0);
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto run = elementwise(bo_a, bo_b, bo_c, padded_ne10, 0); // 0: add, 1: addrelu, 2: mult
-                run.wait();
-                dst_ptr + r * padded_ne10 = bo_c_map;
-            }
-        }
+    for (int i = 0; i < padded_size1; ++i) {
+        int src1_i = (ne11 == 1) ? 0 : (i / padded_ne10 % ne11);
+        int src1_j = (ne10 == 1) ? 0 : (i % padded_ne10);
+        bo_b_map[i] = ((float*)src1->data)[src1_i * ne10 + src1_j];
     }
-    else {
-        for (int ir = ir0; ir < ir1; ++ir) {
-            const int64_t i03 = ir / (ne02 * ne01);
-            const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
-            const int64_t i01 = (ir - i03 * ne02 * ne01 - i02 * ne01);
 
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = i01 % ne11;
+    // Synchronize buffers with device
+    bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            float * dst_ptr = (float *)((char *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1);
-            float * src0_ptr = (float *)((char *)src0->data + i03 * nb03 + i02 * nb02 + i01 * nb01);
+    // Execute the elementwise kernel
+    auto run = elementwise(bo_a, bo_b, bo_c, padded_dst_size, 0);
+    run.wait();
 
-            for (int64_t i0 = 0; i0 < ne00; ++i0) {
-                const int64_t i10 = i0 % ne10;
-                float * src1_ptr = (float *)((char *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11 + i10 * nb10);
+    // Synchronize results back to host
+    bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 
-                bo_a_map[i0] = src0_ptr[i0];
-                bo_b_map[i0] = *src1_ptr;
-                std::fill(bo_c_map, bo_c_map + i0, 0);
-            }
-            bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            auto run = elementwise(bo_a, bo_b, bo_c, padded_ne00, 0); // 0: add, 1: addrelu, 2: mult
-            run.wait();
-            dst_ptr = bo_c_map;
-        }
+    // Copy results to dst
+    for (int i = 0; i < dst_size; ++i) {
+        ((float*)dst->data)[i] = bo_c_map[i];
     }
 }
 
@@ -258,7 +241,7 @@ void ggml_xrt_add(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_xrt_add_f32(src0, src1, dst);
+                ggml_xrt_add_f32(params, dst);
             } break;
         default:
             {
@@ -272,10 +255,11 @@ void ggml_xrt_add(
 extern "C" void ggml_xrt_mul(const struct ggml_compute_params * params,
               struct ggml_tensor * dst);
 
-static void ggml_xrt_mul_f32(struct ggml_tensor * src0, struct ggml_tensor * src1,
+static void ggml_xrt_mul_f32(const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
 
     if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
         return;
@@ -283,97 +267,75 @@ static void ggml_xrt_mul_f32(struct ggml_tensor * src0, struct ggml_tensor * src
 
     const int ith = params->ith;
     const int nth = params->nth;
-    const int64_t nr = ggml_nrows(src0);
+
+    const int nr = ggml_nrows(src0);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    GGML_ASSERT(nb00 == sizeof(float));
     GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb00 == sizeof(float));
 
-    // Determine padded sizes
-    int padded_ne00 = number_elements_padding((int)ne00);
-    int padded_ne01 = number_elements_padding((int)ne01);
-    int padded_ne10 = number_elements_padding((int)ne10);
+    // Rows per thread
+    const int dr = (nr + nth - 1) / nth;
 
-    // Allocate buffers
-    auto bo_a = xrt::bo(myDevice, padded_ne00 * sizeof(float), matmul.group_id(0));
-    auto bo_b = xrt::bo(myDevice, padded_ne00 * sizeof(float), matmul.group_id(1));
-    auto bo_c = xrt::bo(myDevice, padded_ne00 * sizeof(float), matmul.group_id(2));
-    GGML_ASSERT(bo_a != NULL && bo_b != NULL && bo_c != NULL);
+    // Row range for this thread
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    // Determine next power of two sizes
+    int padded_ne00 = next_power_of_two(ne00);
+    int padded_ne01 = next_power_of_two(ne01);
+    int padded_ne10 = next_power_of_two(ne10);
+    int padded_ne11 = ne11;
+
+    int src0_size = ne00 * ne01;
+    int src1_size = ne10 * ne11;
+    int dst_size = ne00 * ne01;
+
+    int padded_size0 = padded_ne00 * padded_ne01;
+    int padded_size1 = padded_ne10 * padded_ne11;
+    int padded_dst_size = padded_ne00 * padded_ne01;
+
+    // Allocate XRT buffers
+    auto bo_a = xrt::bo(myDevice, padded_size0 * sizeof(float), elementwise.group_id(0));
+    auto bo_b = xrt::bo(myDevice, padded_size1 * sizeof(float), elementwise.group_id(1));
+    auto bo_c = xrt::bo(myDevice, padded_dst_size * sizeof(float), elementwise.group_id(2));
+
+    // Map buffers to host memory
     auto bo_a_map = bo_a.map<float*>();
     auto bo_b_map = bo_b.map<float*>();
     auto bo_c_map = bo_c.map<float*>();
 
-    // Temporary buffer for non-contiguous src1 data
-    float* temp_src1 = NULL;
+    // Fill the buffers with zeroes
+    std::fill(bo_a_map, bo_a_map + padded_size0, 0.0f);
+    std::fill(bo_b_map, bo_b_map + padded_size1, 0.0f);
+    std::fill(bo_c_map, bo_c_map + padded_dst_size, 0.0f);
 
-    if (nb10 != sizeof(float)) {
-        temp_src1 = (float*)malloc(ne10 * sizeof(float));
-        GGML_ASSERT(temp_src1 != NULL);
+    // Copy tensor data to buffers with broadcasting
+    for (int i = 0; i < src0_size; ++i) {
+        bo_a_map[i] = ((float*)src0->data)[i];
     }
 
-    // rows per thread
-    const int dr = (nr + nth - 1) / nth;
-
-    // row range for this thread
-    const int ir0 = dr * ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    if (nb10 == sizeof(float)) {
-        for (int ir = ir0; ir < ir1; ++ir) {
-            const int64_t i03 = ir / (ne02 * ne01);
-            const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
-            const int64_t i01 = (ir - i03 * ne02 * ne01 - i02 * ne01);
-
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = i01 % ne11;
-            const int64_t nr0 = padded_ne00 / padded_ne10;
-
-            float * dst_ptr = (float *)((char *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1);
-            float * src0_ptr = (float *)((char *)src0->data + i03 * nb03 + i02 * nb02 + i01 * nb01);
-            float * src1_ptr = (float *)((char *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11);
-
-            for (int64_t r = 0; r < nr0; ++r) {
-                bo_a_map = src0_ptr + r * padded_ne10;
-                bo_b_map = src1_ptr;
-                std::fill(bo_c_map, bo_c_map + padded_ne10, 0);
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                auto run = elementwise(bo_a, bo_b, bo_c, padded_ne10, 2); // 0: add, 1: addrelu, 2: mult
-                run.wait();
-                bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                dst_ptr + r * padded_ne10 = bo_c_map;
-            }
-        }
+    for (int i = 0; i < padded_size1; ++i) {
+        int src1_i = (ne11 == 1) ? 0 : (i / padded_ne10 % ne11);
+        int src1_j = (ne10 == 1) ? 0 : (i % padded_ne10);
+        bo_b_map[i] = ((float*)src1->data)[src1_i * ne10 + src1_j];
     }
-    else {
-        for (int ir = ir0; ir < ir1; ++ir) {
-            const int64_t i03 = ir / (ne02 * ne01);
-            const int64_t i02 = (ir - i03 * ne02 * ne01) / ne01;
-            const int64_t i01 = (ir - i03 * ne02 * ne01 - i02 * ne01);
 
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = i01 % ne11;
+    // Synchronize buffers with device
+    bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            float * dst_ptr = (float *)((char *)dst->data + i03 * nb3 + i02 * nb2 + i01 * nb1);
-            float * src0_ptr = (float *)((char *)src0->data + i03 * nb03 + i02 * nb02 + i01 * nb01);
+    // Execute the elementwise kernel
+    auto run = elementwise(bo_a, bo_b, bo_c, padded_dst_size, 2);  // 2 indicates multiplication
+    run.wait();
 
-            for (int64_t i0 = 0; i0 < ne00; ++i0) {
-                const int64_t i10 = i0 % ne10;
-                float * src1_ptr = (float *)((char *)src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11 + i10 * nb10);
-                bo_a_map[i0] = src0_ptr[i0];
-                bo_b_map[i0] = *src1_ptr;
-                std::fill(bo_c_map, bo_c_map + i0, 0);
-            }
-            bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-            auto run = elementwise(bo_a, bo_b, bo_c, padded_ne00, 2); // 0: add, 1: addrelu, 2: mult
-            run.wait();
-            bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            dst_ptr = bo_c_map;
-        }
+    // Synchronize results back to host
+    bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    // Copy results to dst
+    for (int i = 0; i < dst_size; ++i) {
+        ((float*)dst->data)[i] = bo_c_map[i];
     }
 }
 
@@ -389,7 +351,7 @@ void ggml_xrt_mul(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_xrt_mul_f32(src0, src1, dst);
+                ggml_xrt_mul_f32(params, dst);
             } break;
         default:
             {
@@ -435,12 +397,92 @@ void ggml_xrt_get_rows(
     //}
 }
 
+extern "C" void ggml_xrt_rms_norm(const struct ggml_compute_params * params,
+              struct ggml_tensor * dst);
+
+static void ggml_xrt_rms_norm_f32(const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+     const struct ggml_tensor * src0 = dst->src[0];
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    // Determine next power of two sizes
+    int padded_ne00 = next_power_of_two(ne00);
+    int padded_ne01 = next_power_of_two(ne01);
+
+    // If this is the first thread, prepare the input and output buffers
+    if (ith == 0) {
+        // Compute the total size of the tensor
+        int64_t size = ne00 * ne01;
+
+        // Compute the padded size
+        int64_t padded_size = padded_ne00 * padded_ne01;
+
+        // Declare Buffers
+        auto bo_a = xrt::bo(myDevice, padded_size * sizeof(float), rmsnorm.group_id(0));
+        auto bo_c = xrt::bo(myDevice, padded_size * sizeof(float), rmsnorm.group_id(1));
+
+        auto bo_a_map = bo_a.map<float*>();
+        auto bo_c_map = bo_c.map<float*>();
+
+        // Fill the buffers with zeroes
+        std::fill(bo_a_map, bo_a_map + padded_size, 0.0f);
+        std::fill(bo_c_map, bo_c_map + padded_size, 0.0f);
+
+        // Copy Data from Tensors to Buffers
+        for (int64_t i = 0; i < size; ++i) {
+            bo_a_map[i] = ((float*)src0->data)[i];
+        }
+
+        // Synchronize input buffer with device
+        bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Execute the RMSNorm kernel
+        auto run = rmsnorm(bo_a, bo_c, padded_size);
+        run.wait();
+
+        // Synchronize output buffer with host
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // Copy Data from Buffers to Tensors
+        for (int64_t i = 0; i < size; ++i) {
+            ((float*)dst->data)[i] = bo_out_map[i];
+        }
+    }
+
+    // Wait for all threads to finish (if necessary)
+    params->barrier.wait();
+}
+
 void ggml_xrt_rms_norm(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
 
-    ggml_compute_forward_rms_norm(params, dst);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_xrt_rms_norm_f32(params, dst);
+            } break;
+        default:
+            {
+                ggml_compute_forward_rms_norm(params, dst);
+            } break;
+    }
 }
 
 void ggml_xrt_rope(
@@ -450,124 +492,222 @@ void ggml_xrt_rope(
     ggml_compute_forward_rope(params, dst);
 }
 
+extern "C" void ggml_xrt_soft_max(const struct ggml_compute_params * params,
+              struct ggml_tensor * dst);
+
+static void ggml_xrt_soft_max_f32(const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2];
+
+    assert(ggml_is_contiguous(dst));
+    assert(ggml_are_same_shape(src0, dst));
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+
+    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int64_t ne11 = src1 ? src1->ne[1] : 1;
+    const uint32_t n_head_kv   = ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head_kv));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    const int dr = (nr + nth - 1)/nth;
+
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    float * wp = (float *) params->wdata + (nc + CACHE_LINE_SIZE_F32) * ith;
+
+    float * pos = src2 ? (float *) src2->data : src0->data;
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        float * sp = (float *)((char *) src0->data + i1*src0->nb[1]);
+        float * dp = (float *)((char *)  dst->data +  i1*dst->nb[1]);
+
+        float * mp = src1 ? (float *)((char *) src1->data + (i1%ne11)*src1->nb[1]) : NULL;
+
+        // Copy src0 data to working buffer wp
+        ggml_vec_cpy_f32(nc, wp, sp);
+        
+        // Scale wp by scale factor
+        ggml_vec_scale_f32(nc, wp, scale);
+
+        // Add src1 data to wp if present
+        if (mp) {
+            ggml_vec_acc_f32(nc, wp, mp);
+        }
+
+        // Apply ALiBi bias if max_bias > 0
+        if (max_bias > 0.0f) {
+            const uint32_t h  = (i1/ne01)%ne02;
+            const float slope = h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1);
+
+            for (int i = 0; i < nc; i++) {
+                wp[i] = wp[i] + slope*pos[i];
+            }
+        }
+
+        // Initialize XRT device and buffers
+        auto myDevice = xrt::device(0);
+        auto bo_a = xrt::bo(myDevice, nc * sizeof(float), softmax.group_id(0));
+        auto bo_c = xrt::bo(myDevice, nc * sizeof(float), softmax.group_id(1));
+
+        auto bo_a_map = bo_a.map<float*>();
+        auto bo_c_map = bo_c.map<float*>();
+
+        // Copy input data to device buffer
+        for (int i = 0; i < nc; i++) {
+            bo_a_map[i] = wp[i];
+        }
+
+        // Synchronize buffers to device
+        bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Launch the softmax kernel
+        auto run = softmax(bo_a, bo_c, nc);
+        run.wait();
+
+        // Synchronize buffers from device
+        bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // Copy output data to destination tensor
+        for (int i = 0; i < nc; i++) {
+            dp[i] = bo_c_map[i];
+        }
+    }
+
+    params->barrier.wait();
+}
+
 void ggml_xrt_soft_max(
         const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+        struct ggml_tensor * dst) {
 
-    ggml_compute_forward_soft_max(params, dst);
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_xrt_soft_max_f32(params, dst);
+            } break;
+        default:
+            {
+                ggml_compute_forward_soft_max(params, dst);
+            } break;
+    }
 }
 
 extern "C" void ggml_xrt_mul_mat(const struct ggml_compute_params * params,
               struct ggml_tensor * dst);
 
-static void ggml_xrt_mul_mat_f32(const struct ggml_tensor * src0, const struct ggml_tensor * src1,
+static void ggml_xrt_mul_mat_f32(const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    // Local variables from GGML_TENSOR_BINARY_OP_LOCALS
+    const struct ggml_tensor * src0 = dst->src[0]; // Matrix
+    const struct ggml_tensor * src1 = dst->src[1]; // Vector
+
+    if (params->type == GGML_TASK_INIT || params->type == GGML_TASK_FINALIZE) {
+        return;
+    }
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = ggml_nrows(src0);
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const enum ggml_type type = src0->type;
-
-    // Ensure src1 is a vector (i.e., ne10 is 1 or 2 rows)
-    GGML_ASSERT(ne10 == 1 || ne10 == 2);
-
-    // Ensure the dimensions are compatible for GEMV
-    GGML_ASSERT(ne00 == dst->ne[0]);
-    GGML_ASSERT(ne01 == dst->ne[1]);
-    GGML_ASSERT(ne0 == ne10);
-
-    // We don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
-
-    // dst cannot be transposed or permuted
     GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
+    GGML_ASSERT(nb00 == sizeof(float));
 
-    if (params->type == GGML_TASK_INIT) {
-        return;
-    }
+    // Rows per thread
+    const int dr = (nr + nth - 1) / nth;
 
-    if (params->type == GGML_TASK_FINALIZE) {
-        return;
-    }
+    // Row range for this thread
+    const int ir0 = dr * ith;
+    const int ir1 = MIN(ir0 + dr, nr);
 
-    // Determine padded sizes
-    int padded_ne00 = number_elements_padding((int)ne00);
-    int padded_ne01 = number_elements_padding((int)ne01);
-    int padded_ne10 = number_elements_padding((int)ne10);
+    // Determine next power of two sizes
+    int padded_ne00 = next_power_of_two(ne00); // Columns of src0
+    int padded_ne01 = next_power_of_two(ne01); // Rows of src0
+    int padded_ne10 = next_power_of_two(ne10); // Columns of src1 (which should be equal to ne00)
+    int padded_ne11 = ne11;                    // Rows of src1 (1 or 2 rows)
 
-    // Allocate buffers
-    auto bo_a = xrt::bo(myDevice, padded_ne00 * padded_ne01 * sizeof(float), matmul.group_id(0));
-    auto bo_b = xrt::bo(myDevice, padded_ne10 * sizeof(float), matmul.group_id(1));
-    auto bo_c = xrt::bo(myDevice, padded_ne00 * ne11 * sizeof(float), matmul.group_id(2));
-    GGML_ASSERT(bo_a != NULL && bo_b != NULL && bo_c != NULL);
+    int src0_size = ne00 * ne01;
+    int src1_size = ne10;
+    int dst_size = ne01 * ne11;
+
+    int padded_size0 = padded_ne00 * padded_ne01;
+    int padded_size1 = padded_ne10;  // Single row vector size
+    int padded_dst_size = padded_ne00 * padded_ne11; // Accommodate results for all rows of src1
+
+    // Allocate XRT buffers
+    auto bo_a = xrt::bo(myDevice, padded_size0 * sizeof(float), gemv.group_id(0));
+    auto bo_b = xrt::bo(myDevice, padded_size1 * sizeof(float), gemv.group_id(1)); // Single row vector size
+    auto bo_c = xrt::bo(myDevice, padded_dst_size * sizeof(float), gemv.group_id(2));
+
+    // Map buffers to host memory
     auto bo_a_map = bo_a.map<float*>();
     auto bo_b_map = bo_b.map<float*>();
     auto bo_c_map = bo_c.map<float*>();
 
+    // Fill the buffers with zeroes
+    std::fill(bo_a_map, bo_a_map + padded_size0, 0.0f);
+    std::fill(bo_b_map, bo_b_map + padded_size1, 0.0f);
+    std::fill(bo_c_map, bo_c_map + padded_dst_size, 0.0f);
 
-    // Iterate through the batches of src1 vectors and perform GEMV
-    for (int64_t i03 = 0; i03 < ne03; i03++) {
-        for (int64_t i02 = 0; i02 < ne02; i02++) {
-            // Broadcast src1 into src0
-            const int64_t i13 = i03 % ne13;
-            const int64_t i12 = i02 % ne12;
-            const int64_t i11 = (i12 * ne1 + i13 * ne12 * ne1) % ne1;
-
-            // Copy src0 to buffer_A
-            float *src0_ptr = (float *) src0->data + i02 * ne01 * ne00 + i03 * ne02 * ne01 * ne00;
-            bo_a_map = src0_ptr;
-
-            // Initialize buffer_C to zero
-            std::fill(bo_c_map, bo_c_map + padded_ne00 * ne11, 0);
-
-            // Handle the case where B has 2 rows
-            if (ne11 == 2) {
-                // Split B into two separate vectors
-                float * src1_ptr_1 = (float *) src1->data + i12 * ne11 * ne10 + i13 * ne12 * ne11 * ne10;
-                float * src1_ptr_2 = (float *) src1->data + i12 * ne11 * ne10 + i13 * ne12 * ne11 * ne10 + padded_ne10;
-                bo_b_map = src1_ptr_1;
-
-                // Copy src1 to buffer_B1 and buffer_B2
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                // Call the custom accelerator function for the first row
-                auto run = matvecmul(bo_a, bo_b, bo_c, padded_ne01, padded_ne10, padded_ne01);
-                run.wait();
-
-                // Call the custom accelerator function for the second row
-                bo_b_map = src1_ptr_2;
-
-                // Copy src1 to buffer_B1 and buffer_B2
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                auto run = matvecmul(bo_a, bo_b, bo_c, padded_ne00, padded_ne10, padded_ne00);
-                run.wait();
-
-            } else {
-                // Copy src1 to buffer_B
-                float *src1_ptr = (float *) src1->data + i12 * ne11 * ne10 + i13 * ne12 * ne11 * ne10;
-
-                // Copy src1 to buffer_B1 and buffer_B2
-                bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-                // Call the custom accelerator function for the first row
-                auto run = matvecmul(bo_a, bo_b, bo_c, padded_ne00, padded_ne10, padded_ne00);
-                run.wait();
-            }
-
-            // Copy result from buffer_C to dst
-            bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            (float *) dst->data + i02 * ne01 * ne00 + i03 * ne02 * ne01 * ne00 = bo_c_map;
+    // Copy src0 data to A buffer
+    for (int64_t i = 0; i < ne01; ++i) {
+        for (int64_t j = 0; j < ne00; ++j) {
+            bo_a_map[i * padded_ne10 + j] = ((float*)src0->data)[i * ne00 + j];
         }
     }
-} 
+
+    // Handle case where src1 has 1 or 2 rows
+    for (int64_t row = 0; row < ne11; ++row) {
+        for (int64_t j = 0; j < ne10; ++j) {
+            bo_b_map[j] = ((float*)((char*)src1->data + row * nb11))[j];
+        }
+
+        // Synchronize buffers with device
+        bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // Execute the GEMV kernel
+        auto run = gemv(bo_a, bo_b, bo_c, padded_ne01, padded_ne10, 1);
+        run.wait();
+
+        // Synchronize results back to host
+        bo_c.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+        // Copy result to dst, assuming dst shape matches the shape of src0
+        for (int64_t i = 0; i < ne01; ++i) {
+            ((float*)((char*)dst->data + row * nb1))[i] = bo_c_map[i];
+        }
+    }
+}
 
 void ggml_xrt_mul_mat(
         const struct ggml_compute_params * params,
@@ -581,7 +721,7 @@ void ggml_xrt_mul_mat(
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                ggml_xrt_mul_mat_f32(src0, src1, dst);
+                ggml_xrt_gemv_f32(params, dst);
             } break;
         default:
             {
@@ -590,11 +730,28 @@ void ggml_xrt_mul_mat(
     }
 }
 
-static void ggml_xrt_unary(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
+extern "C" void ggml_xrt_unary(const struct ggml_compute_params * params,
+              struct ggml_tensor * dst);
 
-    ggml_compute_forward_unary(params, dst);
+void ggml_xrt_unary(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_xrt_unary_f32(src0, src1, dst);
+            } break;
+        default:
+            {
+                ggml_compute_forward_unary(params, dst);
+            } break;
+    }
 }
 
 bool ggml_xrt_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
