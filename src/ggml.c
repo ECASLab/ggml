@@ -32,6 +32,10 @@
 #include <unistd.h>
 #endif
 
+#define _XOPEN_SOURCE 500
+#define BILLION 1000000000L
+#include <sys/time.h>
+
 #ifdef __ARM_FEATURE_MATMUL_INT8
 #undef GGML_USE_LLAMAFILE
 #endif
@@ -17248,6 +17252,11 @@ static void ggml_compute_forward_cross_entropy_loss_back(
 }
 
 /////////////////////////////////
+#ifdef CLOCK
+int operationCounters[GGML_OP_COUNT] = {0};
+struct timespec start, end;
+int64_t elapsed_ns;
+#endif
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor, struct ggml_compute_state * state) {
     GGML_ASSERT(params);
@@ -17255,6 +17264,21 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
+
+    #ifdef CLOCK
+    // Get the starting time
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    #endif //CLOCK
+
+    #ifdef EXTRACT_TENSOR
+            if (tensor->src1 != NULL)
+            {
+                struct ggml_tensor * src0 = tensor->src[0];
+                struct ggml_tensor * src1 = tensor->src[1];
+            } else {
+                struct ggml_tensor * src0 = tensor->src[0];
+            }
+    #endif //TENSORS
 
     switch (tensor->op) {
         case GGML_OP_DUP:
@@ -17581,6 +17605,27 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ASSERT(false);
             } break;
     }
+    #ifdef CLOCK
+        // Get the ending time
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        // Calculate the elapsed time in nanoseconds
+        elapsed_ns = (end.tv_sec - start.tv_sec) * BILLION + (end.tv_nsec - start.tv_nsec);
+        operationCounters[tensor->op]++;
+        printf("Operation %d executed in %llu nanoseconds. Count: %d\n", tensor->op, elapsed_ns, operationCounters[tensor->op]);
+    #endif
+    #ifdef EXTRACT_TENSOR
+        if (tensor->src1 != NULL)
+        {
+            printf("DName: %c, SName: %c, S2Name: %c, d1: %d, d2: %d, d3: %d, d4: %d, sp1: %d, sp2: %d, sp3: %d, sp4: %d, 
+            ss1: %d, ss2: %d, ss3: %d, ss4: %d", tensor->name, tensor->src0->name, tensor->src1->name, tensor->ne[0], tensor->ne[1],
+            tensor->ne[2], tensor->ne[3], tensor->src0->ne[0], tensor->src0->ne[1], tensor->src0->ne[2], tensor->src0->ne[3], 
+            tensor->src1->ne[0], tensor->src1->ne[1], tensor->src1->ne[2], tensor->src1->ne[3]);
+        } else {
+            printf("DName: %c, SName: %c, S2Name: %c, d1: %d, d2: %d, d3: %d, d4: %d, sp1: %d, sp2: %d, sp3: %d, sp4: %d", 
+            tensor->name, tensor->src0->name, tensor->src1->name, tensor->ne[0], tensor->ne[1],
+            tensor->ne[2], tensor->ne[3], tensor->src0->ne[0], tensor->src0->ne[1], tensor->src0->ne[2], tensor->src0->ne[3]);
+        }
+    #endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -19720,6 +19765,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     const int64_t perf_start_cycles  = ggml_perf_cycles();
     const int64_t perf_start_time_us = ggml_perf_time_us();
+
+    // Conditional compilation for graph export
+    #ifdef EXPORT_GRAPH
+    ggml_graph_export(cgraph, "graph.dot");
+    #endif
 
     // this is a work thread too
     ggml_graph_compute_thread(&workers[0]);
