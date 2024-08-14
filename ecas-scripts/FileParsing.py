@@ -25,7 +25,7 @@ def process_file(file_path):
     operation_details = {}
 
     # Obtiene las expresiones regulares del 
-    regex = re.compile(r'Operation (\d+) executed in (\d+\.\d+) microseconds\. Count: (\d+)')
+    regex = re.compile(r'Operation (\d+) executed in (\d+) nanoseconds\. Count: (\d+)')
 
     # Lee el archivo y toma las operaciones
     with open(file_path, 'r') as file:
@@ -62,7 +62,7 @@ def process_file(file_path):
         highest_count = details['count']
         operation_name = details['operation_name']
         median_execution_time = np.median(details['execution_times'])
-        print(f"Operation {operation_number}, named {operation_name} has a microseconds mean of {mean_execution_time:.6f}, "
+        print(f"Operation {operation_number}, named {operation_name} has a nanoseconds mean of {mean_execution_time:.6f}, "
               f"its lowest execution time is {lowest_execution_time:.6f}, "
               f"its medium execution time is {median_execution_time:.6f}, "
               f"its highest execution time is {highest_execution_time:.6f} "
@@ -89,36 +89,18 @@ def create_plots(operation_details, output_filename):
     plt.title('Histogram of Highest Counts')
     plt.xticks(rotation=45, ha="right")  # Rota el eje X por legibilidad
     plt.tight_layout()
-    plt.yscale('log')
+    #plt.yscale('log')
     plt.savefig(output_filename + '_histogram.png') 
 
     # Crea el diagrama de bigotes del tiempo de ejecución
     plt.figure(figsize=(10, 5))
     plt.boxplot(execution_times_data, labels=operation_names)
     plt.xlabel('Operation Name')
-    plt.ylabel('Execution Times (µs)')
+    plt.ylabel('Execution Times (ns)')
     plt.title('Boxplot of Execution Times')
     plt.xticks(rotation=45, ha="right")  # Rota el eje X por legibilidad
     plt.tight_layout()
     plt.savefig(output_filename + '_boxplot.png')  
-
-    # Especifica la operación para el tercer histograma
-    target_operation_number = 23 
-    target_execution_times = sorted_operation_details[target_operation_number]["execution_times"]
-
-    # Crea el histograma de tiempos de la multiplicación matricial
-    step = 2000
-    indexes = np.arange(0, len(target_execution_times), step)
-    plt.figure(figsize=(8, 4))
-    plt.bar(indexes, [target_execution_times[i] for i in indexes], color='skyblue', edgecolor='black')
-    plt.xlabel('Index')
-    plt.ylabel('Execution Time (µs)')
-    plt.title(f'Histogram of Execution Times for {sorted_operation_details[target_operation_number]["operation_name"]} (Step={step})')
-    plt.tight_layout()
-    plt.yscale('log')
-    plt.savefig(output_filename + '_specific_histogram.png') 
-
-    plt.show()
     
 if __name__ == "__main__":
 
@@ -132,6 +114,5 @@ if __name__ == "__main__":
     operations = process_file(args.input_file)
 
     create_plots(operations, args.input_file)
-
 
 
